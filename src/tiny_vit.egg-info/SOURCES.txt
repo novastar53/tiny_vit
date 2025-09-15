@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+src/tiny_vit/main.py
+src/tiny_vit.egg-info/PKG-INFO
+src/tiny_vit.egg-info/SOURCES.txt
+src/tiny_vit.egg-info/dependency_links.txt
+src/tiny_vit.egg-info/top_level.txt
