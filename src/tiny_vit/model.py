@@ -1,4 +1,6 @@
+from typing import Literal
 from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import flax.nnx as nnx
@@ -16,16 +18,22 @@ class Config:
     in_channels: int = 3
     n_classes: int = 10
 
-    n_layer: int = 4
-    embed_dim: int = 8
+    n_layer: int = 8
+    embed_dim: int = 192
+    hidden_dim: int = 192 * 4
+
+    n_heads: int = 3
+    sdpa_implementation: Literal["xla", "cudnn", "slow"] = (
+        "xla"  # self-attention kernel implementation
+    )
 
 
 
 class Block(nnx.Module):
     def __init__(self, config: Config, rngs: nnx.Rngs):
         self.config = config
-        self.ln1 = nnx.LayerNorm()
-        self.ln2 = nnx.LayerNorm()
+        self.ln1 = nnx.LayerNorm(config.embed_dim, rngs=rngs)
+        self.ln2 = nnx.LayerNorm(config.embed_dim, rngs=rngs)
         self.attn = CausalSelfAttention(config, rngs)
         self.glu = GLU(config, rngs)
     
@@ -47,6 +55,7 @@ class TinyViT(nnx.Module):
             config.n_classes,
             rngs=rngs
         )
+        self.h = [ Block(config, rngs) for _ in range(config.n_layer) ]
 
 
     def __call__(self, x):
