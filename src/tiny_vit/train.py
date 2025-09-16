@@ -51,10 +51,11 @@ cfg = DataConfig(
 print("Building train dataloader…")
 m.train()
 
-for e in range(100):
-    train_iter = make_dataloader("train", cfg)
-    for x, y in train_iter:
-        logits = m(x)
-        loss, acc = step_fn(m, optimizer, x, y)
-    print(loss, acc)
+train_iter = make_dataloader("train", cfg)
+i = 0
+for x, y in train_iter:
+    logits = m(x)
+    loss, acc = step_fn(m, optimizer, x, y)
+    i % 100 == 0 and print(loss, acc)
+    i += 1
 
