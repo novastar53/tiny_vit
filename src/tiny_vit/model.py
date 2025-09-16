@@ -19,6 +19,7 @@ class Config:
     n_classes: int = 10
 
     n_layer: int = 8
+    dropout: float = 0.0
     embed_dim: int = 192
     hidden_dim: int = 192 * 4
 
@@ -34,13 +35,15 @@ class Block(nnx.Module):
         self.config = config
         self.ln1 = nnx.LayerNorm(config.embed_dim, rngs=rngs)
         self.ln2 = nnx.LayerNorm(config.embed_dim, rngs=rngs)
+        self.dropout1 = nnx.Dropout(rate=config.dropout)
+        self.dropout2 = nnx.Dropout(rate=config.dropout)
         self.attn = CausalSelfAttention(config, rngs)
         self.glu = GLU(config, rngs)
     
 
     def __call__(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.glu(self.ln2(x))
+        x = x + self.dropout1(self.attn(self.ln1(x)))
+        x = x + self.dropout2(self.glu(self.ln2(x)))
         return x
 
 
