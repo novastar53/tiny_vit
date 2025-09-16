@@ -33,26 +33,70 @@ class DataConfig:
     shard_for_pmap: bool = False        # True → shape (n_devices, per_device_bs, ...)
     prefetch: int = 2                   # tf.data prefetch buffer
 
-def _normalize_uint8_to_float32(img_uint8: tf.Tensor) -> tf.Tensor:
+    # Augmentations (reference: Keras preprocessing snippet)
+    resize_to: Optional[int] = 72          # None = no resize; 72 to match reference
+    augment: bool = True                   # apply random aug on train split
+    rotation_factor: float = 0.02
+    zoom_height: float = 0.2
+    zoom_width: float = 0.2
+
+def _to_float_and_normalize(img_uint8: tf.Tensor) -> tf.Tensor:
     """uint8 [0,255] → float32 normalized by CIFAR-10 stats."""
-    # to float in [0,1]
-    x = tf.cast(img_uint8, tf.float32) / 255.0
-    # normalize per channel
+    x = tf.cast(img_uint8, tf.float32) / 255.0  # to [0,1]
     mean = tf.constant(np.array(CIFAR10_MEAN), dtype=tf.float32)
     std  = tf.constant(np.array(CIFAR10_STD), dtype=tf.float32)
     return (x - mean) / std
 
-def _prep_example(example: dict, one_hot: bool = False) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Map a TFDS example to (image, label) with normalization, no augmentation."""
-    # example["image"]: [32,32,3] uint8, example["label"]: scalar int64
-    x = _normalize_uint8_to_float32(example["image"])  # [H,W,C] float32
-    y = tf.cast(example["label"], tf.int32)
+def _build_keras_layers(cfg: DataConfig, is_train: bool):
+    """
+    Build Keras preprocessing/augmentation layers (channel-last) to mirror the reference:
+      - Normalization (we already normalize by CIFAR stats in _to_float_and_normalize, so we omit it here)
+      - Resizing(72,72)
+      - RandomRotation(0.02)  [train only]
+      - RandomZoom(0.2, 0.2)  [train only]
+    Returns (resize_layer, aug_layer_or_None)
+    """
+    # Resizing for both train/test if configured
+    resize_layer = None
+    if cfg.resize_to is not None:
+        resize_layer = tf.keras.layers.Resizing(cfg.resize_to, cfg.resize_to)
 
+    aug_layer = None
+    if is_train and cfg.augment:
+        aug_layer = tf.keras.Sequential([
+            tf.keras.layers.RandomRotation(factor=cfg.rotation_factor),
+            tf.keras.layers.RandomZoom(height_factor=cfg.zoom_height, width_factor=cfg.zoom_width),
+        ])
+    return resize_layer, aug_layer
+
+def _prep_example(example: dict,
+                  one_hot: bool = False,
+                  resize_layer: Optional[tf.keras.layers.Layer] = None,
+                  aug_layer: Optional[tf.keras.layers.Layer] = None) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Map a TFDS example to (image, label) with optional resize/augment + normalization."""
+    # example["image"]: [32,32,3] uint8, example["label"]: scalar int64
+    x = tf.cast(example["image"], tf.float32) / 255.0  # [H,W,C] float32 in [0,1]
+
+    # Resize (both train/test) to match the reference if configured
+    if resize_layer is not None:
+        x = resize_layer(x)
+
+    # Random augmentation (train only)
+    if aug_layer is not None:
+        # Keras preprocessing layers behave according to 'training' flag
+        x = aug_layer(x, training=True)
+
+    # Now normalize to CIFAR stats (channel-last)
+    mean = tf.constant(np.array(CIFAR10_MEAN), dtype=tf.float32)
+    std  = tf.constant(np.array(CIFAR10_STD), dtype=tf.float32)
+    x = (x - mean) / std
+
+    # Label
+    y = tf.cast(example["label"], tf.int32)
     if one_hot:
         y = tf.one_hot(y, depth=10, dtype=tf.float32)  # [10]
 
     # Convert to channels-first for many JAX ViT impls (optional).
-    # If your model expects channels-last, comment the transpose out.
     x = tf.transpose(x, [2, 0, 1])  # [C,H,W]
     return x, y
 
@@ -66,10 +110,14 @@ def _build_tfds_pipeline(split: str, cfg: DataConfig) -> tf.data.Dataset:
         with_info=False,
     )
 
+    is_train = (split == "train" or split.startswith("train"))
+    resize_layer, aug_layer = _build_keras_layers(cfg, is_train=is_train)
+
     if cfg.shuffle and split == "train":
         ds = ds.shuffle(cfg.shuffle_buffer, seed=cfg.seed, reshuffle_each_iteration=True)
 
-    ds = ds.map(lambda ex: _prep_example(ex, cfg.one_hot), num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(lambda ex: _prep_example(ex, cfg.one_hot, resize_layer, aug_layer),
+                num_parallel_calls=tf.data.AUTOTUNE)
 
     # set batch size; for sharding we’ll reshape later in Python/jax
     ds = ds.batch(cfg.batch_size, drop_remainder=cfg.drop_last)
@@ -134,7 +182,7 @@ if __name__ == "__main__":
 
     x, y = next(train_iter)
     print("✅ Got a batch.")
-    print(f"x: shape={x.shape}, dtype={x.dtype}  (expect [B,3,32,32])")
+    print(f"x: shape={x.shape}, dtype={x.dtype}  (expect [B,3,H,W] with H=W={cfg.resize_to or 32})")
     print(f"y: shape={y.shape}, dtype={y.dtype}  (expect [B])")
     print(f"min/max x after norm: {x.min().item():.3f}, {x.max().item():.3f}")
 

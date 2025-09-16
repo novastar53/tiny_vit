@@ -11,8 +11,8 @@ from glu import GLU
 
 @dataclass
 class Config:
-    image_size: int = 32
-    patch_size: int = 4
+    image_size: int = 72
+    patch_size: int = 6
     grid_size: int = image_size // patch_size
     num_patches: int = grid_size * grid_size
     in_channels: int = 3
@@ -22,7 +22,7 @@ class Config:
     embed_dim: int = 192
     hidden_dim: int = 192 * 4
 
-    n_heads: int = 3
+    n_heads: int = 4
     sdpa_implementation: Literal["xla", "cudnn", "slow"] = (
         "xla"  # self-attention kernel implementation
     )
