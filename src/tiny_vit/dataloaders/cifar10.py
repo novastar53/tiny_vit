@@ -47,46 +47,54 @@ def _to_float_and_normalize(img_uint8: tf.Tensor) -> tf.Tensor:
     std  = tf.constant(np.array(CIFAR10_STD), dtype=tf.float32)
     return (x - mean) / std
 
-def _build_keras_layers(cfg: DataConfig, is_train: bool):
-    """
-    Build Keras preprocessing/augmentation layers (channel-last) to mirror the reference:
-      - Normalization (we already normalize by CIFAR stats in _to_float_and_normalize, so we omit it here)
-      - Resizing(72,72)
-      - RandomRotation(0.02)  [train only]
-      - RandomZoom(0.2, 0.2)  [train only]
-    Returns (resize_layer, aug_layer_or_None)
-    """
-    # Resizing for both train/test if configured
-    resize_layer = None
-    if cfg.resize_to is not None:
-        resize_layer = tf.keras.layers.Resizing(cfg.resize_to, cfg.resize_to)
-
-    aug_layer = None
-    if is_train and cfg.augment:
-        aug_layer = tf.keras.Sequential([
-            tf.keras.layers.RandomRotation(factor=cfg.rotation_factor),
-            tf.keras.layers.RandomZoom(height_factor=cfg.zoom_height, width_factor=cfg.zoom_width),
-        ])
-    return resize_layer, aug_layer
-
 def _prep_example(example: dict,
-                  one_hot: bool = False,
-                  resize_layer: Optional[tf.keras.layers.Layer] = None,
-                  aug_layer: Optional[tf.keras.layers.Layer] = None) -> Tuple[tf.Tensor, tf.Tensor]:
-    """Map a TFDS example to (image, label) with optional resize/augment + normalization."""
-    # example["image"]: [32,32,3] uint8, example["label"]: scalar int64
+                  one_hot: bool,
+                  cfg: DataConfig,
+                  is_train: bool) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Map a TFDS example to (image, label) with optional resize/augment + normalization.
+    Uses tf.image ops (graph-compiled) for speed. Rotation uses tensorflow-addons if available.
+    """
+    # example["image"]: [H,W,C] uint8, example["label"]: scalar int64
     x = tf.cast(example["image"], tf.float32) / 255.0  # [H,W,C] float32 in [0,1]
 
-    # Resize (both train/test) to match the reference if configured
-    if resize_layer is not None:
-        x = resize_layer(x)
+    # Resize (both train/test) to match reference if configured
+    if cfg.resize_to is not None:
+        x = tf.image.resize(x, [cfg.resize_to, cfg.resize_to], method='bilinear')
 
-    # Random augmentation (train only)
-    if aug_layer is not None:
-        # Keras preprocessing layers behave according to 'training' flag
-        x = aug_layer(x, training=True)
+    # Augment (train only)
+    if is_train and cfg.augment:
+        # --- Random rotation (small) via tensorflow-addons if available ---
+        if cfg.rotation_factor and cfg.rotation_factor > 0:
+            try:
+                import tensorflow_addons as tfa  # type: ignore
+                # angle in radians sampled from [-rotation_factor*pi, +rotation_factor*pi]
+                angle = (tf.random.uniform([], minval=-cfg.rotation_factor, maxval=cfg.rotation_factor)
+                         * tf.constant(tf.experimental.numpy.pi, tf.float32))
+                x = tfa.image.rotate(x, angles=angle, interpolation='bilinear')
+            except Exception:
+                # If tfa isn't installed, skip rotation silently
+                pass
 
-    # Now normalize to CIFAR stats (channel-last)
+        # --- Random zoom implemented as crop-then-resize ---
+        if (cfg.zoom_height and cfg.zoom_height > 0) or (cfg.zoom_width and cfg.zoom_width > 0):
+            H = tf.shape(x)[0]
+            W = tf.shape(x)[1]
+            # Sample zoom factors around 1.0
+            zh = tf.random.uniform([], 1.0 - tf.cast(cfg.zoom_height, tf.float32), 1.0 + tf.cast(cfg.zoom_height, tf.float32))
+            zw = tf.random.uniform([], 1.0 - tf.cast(cfg.zoom_width, tf.float32), 1.0 + tf.cast(cfg.zoom_width, tf.float32))
+            # Compute target crop sizes (inverse of zoom)
+            target_h = tf.cast(tf.round(tf.cast(H, tf.float32) / zh), tf.int32)
+            target_w = tf.cast(tf.round(tf.cast(W, tf.float32) / zw), tf.int32)
+            target_h = tf.clip_by_value(target_h, 8, H)
+            target_w = tf.clip_by_value(target_w, 8, W)
+            # Center crop
+            off_h = (H - target_h) // 2
+            off_w = (W - target_w) // 2
+            x = tf.image.crop_to_bounding_box(x, off_h, off_w, target_h, target_w)
+            # Resize back to original (post-resize) shape
+            x = tf.image.resize(x, [H, W], method='bilinear')
+
+    # Normalize to CIFAR stats (channel-last)
     mean = tf.constant(np.array(CIFAR10_MEAN), dtype=tf.float32)
     std  = tf.constant(np.array(CIFAR10_STD), dtype=tf.float32)
     x = (x - mean) / std
@@ -94,9 +102,9 @@ def _prep_example(example: dict,
     # Label
     y = tf.cast(example["label"], tf.int32)
     if one_hot:
-        y = tf.one_hot(y, depth=10, dtype=tf.float32)  # [10]
+        y = tf.one_hot(y, depth=10, dtype=tf.float32)
 
-    # Convert to channels-first for many JAX ViT impls (optional).
+    # Convert to channels-first for JAX
     x = tf.transpose(x, [2, 0, 1])  # [C,H,W]
     return x, y
 
@@ -110,13 +118,20 @@ def _build_tfds_pipeline(split: str, cfg: DataConfig) -> tf.data.Dataset:
         with_info=False,
     )
 
+    options = tf.data.Options()
+    options.experimental_deterministic = False
+    options.experimental_slack = True
+    ds = ds.with_options(options)
+
+    # Cache decoded dataset to speed up subsequent epochs
+    ds = ds.cache()
+
     is_train = (split == "train" or split.startswith("train"))
-    resize_layer, aug_layer = _build_keras_layers(cfg, is_train=is_train)
 
     if cfg.shuffle and split == "train":
         ds = ds.shuffle(cfg.shuffle_buffer, seed=cfg.seed, reshuffle_each_iteration=True)
 
-    ds = ds.map(lambda ex: _prep_example(ex, cfg.one_hot, resize_layer, aug_layer),
+    ds = ds.map(lambda ex: _prep_example(ex, cfg.one_hot, cfg, is_train),
                 num_parallel_calls=tf.data.AUTOTUNE)
 
     # set batch size; for sharding we’ll reshape later in Python/jax
@@ -125,7 +140,7 @@ def _build_tfds_pipeline(split: str, cfg: DataConfig) -> tf.data.Dataset:
     # repeat for multiple epochs (or forever if None)
     ds = ds.repeat(cfg.num_epochs) if cfg.num_epochs is not None else ds.repeat()
 
-    ds = ds.prefetch(cfg.prefetch)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
 def _to_jax_batches(ds: tf.data.Dataset) -> Iterator[Tuple[jnp.ndarray, jnp.ndarray]]:
