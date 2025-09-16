@@ -10,15 +10,17 @@ class CausalSelfAttention(nnx.Module):
 
 
     def __call__(self, x):
+        B, T, C = x.shape
         qkv = self.qkv(x)
-        q, k, v = nnx.split(qkv, 3, axis=-1)
-        q = q.reshape(-1, config.n_heads, config.embed_dim // config.n_heads)
-        k = k.reshape(-1, config.n_heads, config.embed_dim // config.n_heads)
-        v = v.reshape(-1, config.n_heads, config.embed_dim // config.n_heads)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
+        q = q.reshape(B, T, self.config.n_heads, self.config.embed_dim // self.config.n_heads)
+        k = k.reshape(B, T, self.config.n_heads, self.config.embed_dim // self.config.n_heads)
+        v = v.reshape(B, T, self.config.n_heads, self.config.embed_dim // self.config.n_heads)
         y = jax.nn.dot_product_attention(
                 q,
                 k,
                 v,
                 implementation=self.config.sdpa_implementation
         )
+        y = y.reshape(B, T, C)
         return y

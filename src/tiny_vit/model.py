@@ -41,6 +41,7 @@ class Block(nnx.Module):
     def __call__(self, x):
         x = x + self.attn(self.ln1(x))
         x = x + self.glu(self.ln2(x))
+        return x
 
 
 class TinyViT(nnx.Module):
@@ -55,6 +56,7 @@ class TinyViT(nnx.Module):
             config.n_classes,
             rngs=rngs
         )
+        self.pos = nnx.Param(jnp.zeros((1, config.grid_size * config.grid_size, config.embed_dim)))
         self.h = [ Block(config, rngs) for _ in range(config.n_layer) ]
 
 
@@ -64,7 +66,9 @@ class TinyViT(nnx.Module):
                       self.config.grid_size, self.config.patch_size)
         x = jnp.transpose(x, (0, 2, 4, 1, 3, 5))
         x = x.reshape(B, self.config.grid_size * self.config.grid_size, nC * self.config.patch_size * self.config.patch_size)
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) + self.pos.value
+        for i in range(self.config.n_heads):
+            x = self.h[i](x)
         x = x.mean(axis=1)
         y = self.head(x)
         return y

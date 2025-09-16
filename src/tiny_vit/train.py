@@ -45,6 +45,7 @@ cfg = DataConfig(
 
 print("Building train dataloader…")
 train_iter = make_dataloader("train", cfg)
+m.train()
 
 for e in range(10):
     for x, y in train_iter:
